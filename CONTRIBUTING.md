@@ -28,4 +28,5 @@ npm run test:e2e # cross-tab behaviour in real Chromium tabs (needs `npx playwri
 1. Move **Unreleased** entries in `CHANGELOG.md` under the new version.
 2. `npm version <patch|minor|major>` and push the tag.
 3. The `Release` workflow verifies, publishes to npm with provenance, and creates a GitHub release.
-   It needs an `NPM_TOKEN` repository secret.
+   It authenticates with npm [trusted publishing](https://docs.npmjs.com/trusted-publishers), so no
+   npm token is stored in the repository.
