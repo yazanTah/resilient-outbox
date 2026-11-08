@@ -287,14 +287,19 @@ export class OutboxQueue {
   }
 
   private normalize(m: Mutation, resetSyncing: boolean): Mutation {
+    // Persisted data is untrusted: drop keys that could re-point an object's prototype when the
+    // record is later merged into a live mutation with Object.assign
+    const safe = Object.fromEntries(
+      Object.entries(m).filter(([key]) => key !== '__proto__' && key !== 'constructor' && key !== 'prototype')
+    ) as unknown as Mutation;
     return {
-      ...m,
-      attempts: typeof m.attempts === 'number' ? m.attempts : 0,
-      maxAttempts: typeof m.maxAttempts === 'number' ? m.maxAttempts : this.retryConfig.maxAttempts,
-      nextAttemptAt: typeof m.nextAttemptAt === 'number' ? m.nextAttemptAt : 0,
+      ...safe,
+      attempts: typeof safe.attempts === 'number' ? safe.attempts : 0,
+      maxAttempts: typeof safe.maxAttempts === 'number' ? safe.maxAttempts : this.retryConfig.maxAttempts,
+      nextAttemptAt: typeof safe.nextAttemptAt === 'number' ? safe.nextAttemptAt : 0,
       // If the app was killed mid-request, the request may or may not have reached the server.
       // Replaying it is safe because it carries the same idempotency key.
-      status: resetSyncing && m.status === 'syncing' ? 'pending' : m.status
+      status: resetSyncing && safe.status === 'syncing' ? 'pending' : safe.status
     };
   }
 
@@ -662,9 +667,9 @@ export class OutboxQueue {
       if (Array.isArray(val)) return val.map(substitute);
       // Only plain objects are walked; Dates, class instances, Blobs etc. are passed through
       if (isPlainObject(val)) {
-        const out: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(val)) out[k] = substitute(v);
-        return out;
+        // fromEntries defines own properties, so a "__proto__" key is copied as data instead of
+        // replacing the copy's prototype
+        return Object.fromEntries(Object.entries(val).map(([k, v]) => [k, substitute(v)]));
       }
       return val;
     };

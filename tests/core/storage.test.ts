@@ -1,5 +1,6 @@
 import { OutboxQueue } from '../../src/core/queue.js';
 import { MemoryStorageAdapter } from '../../src/adapters/index.js';
+import { MemoryCoordinator } from '../../src/core/coordinator.js';
 import type { Mutation, SyncContext } from '../../src/core/types.js';
 import { FlakyStorage, silentLogger } from '../helpers/index.js';
 
@@ -218,5 +219,45 @@ describe('Temp-ID map retention', () => {
     const queue = new OutboxQueue({ name: 'inf', storage, idMapTtlMs: Infinity, executor: async () => ({}) });
     await queue.enqueue({ type: 'A', payload: {} });
     expect(storedState(storage, 'inf').idMap).toHaveLength(1);
+  });
+});
+
+describe('Untrusted persisted data', () => {
+  const evil = JSON.stringify({ version: 2, idMap: [], mutations: [] }).replace(
+    '"mutations":[]',
+    '"mutations":[{"id":"m","type":"T","status":"pending","attempts":0,"maxAttempts":5,"nextAttemptAt":0,' +
+      '"payload":{"__proto__":{"polluted":"yes"},"keep":"me"},"__proto__":{"hacked":true}}]'
+  );
+
+  test.each([
+    ['single instance', false],
+    ['cross-tab', true]
+  ] as const)('%s: __proto__ keys never change prototypes', async (_label, crossTab) => {
+    const storage = new FlakyStorage();
+    storage.data.set(KEY('evil'), evil);
+    const resolved: unknown[] = [];
+    const queue = new OutboxQueue({
+      name: 'evil',
+      storage,
+      crossTab: crossTab ? new MemoryCoordinator() : false,
+      executor: async (m: Mutation, ctx: SyncContext) => {
+        resolved.push(ctx.resolvePayload(m.payload));
+        return {};
+      }
+    });
+    await queue.hydrate();
+    // A second sync merges the stored record into the live object (the cross-tab path)
+    await queue.enqueue({ type: 'NEXT', payload: {} });
+    const m = queue.get('m')!;
+    expect(Object.getPrototypeOf(m)).toBe(Object.prototype);
+    expect((m as unknown as { hacked?: unknown }).hacked).toBeUndefined();
+
+    expect(await queue.flush()).toBeGreaterThanOrEqual(1);
+    const payload = resolved[0] as Record<string, unknown>;
+    expect(Object.getPrototypeOf(payload)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(payload, '__proto__')).toBe(true); // kept as data
+    expect(payload.keep).toBe('me');
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    queue.destroy();
   });
 });
