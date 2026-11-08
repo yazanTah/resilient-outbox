@@ -1,6 +1,6 @@
 {
   "name": "resilient-outbox",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Durable offline mutation queue for React Native, Expo and the web: idempotency keys, dependency chaining with temp-ID mapping, and a dead-letter queue.",
   "keywords": [
     "offline",

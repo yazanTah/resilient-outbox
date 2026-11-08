@@ -6,9 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-08
+
+### Security
+
+- Hardened handling of untrusted data: a payload key named `__proto__` is now copied as data by
+  `resolvePayload` instead of replacing the copy's prototype (which also dropped the key), and
+  persisted mutation records can no longer re-point a live mutation's prototype in cross-tab mode.
+  Global `Object.prototype` pollution was never possible.
+
 ### Changed
 
-- Development tooling: Jest 30, tsup 9, GitHub Actions v7. No change to the published library.
+- Development tooling: Jest 30, tsup 9, GitHub Actions v7. No change to the library's behaviour.
+- README: static license badge.
 
 ## [1.0.0] - first public release
 
@@ -58,5 +68,6 @@ All notable changes to this project are documented here. The format follows
 - `501` and `505` are now permanent errors; `408` and `425` are retryable.
 - A mutation that is mid-request can no longer be removed.
 
-[Unreleased]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/yazanTah/resilient-outbox/releases/tag/v1.0.0
