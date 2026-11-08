@@ -5,10 +5,37 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # Packages that must move in lockstep, or `npm ci` fails on peer conflicts
+      react:
+        patterns: ['react', 'react-dom', '@types/react', '@types/react-dom', '@testing-library/*']
+      jest:
+        patterns: ['jest', 'jest-*', '@types/jest', 'ts-jest']
+      eslint:
+        patterns: ['eslint', 'eslint-*', '@eslint/*', 'typescript-eslint']
       dev-dependencies:
         dependency-type: development
         update-types: [minor, patch]
+    ignore:
+      # ts-jest supports TypeScript < 7 only; revisit when ts-jest adds support
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
+      # React is a peer dependency tested on 18 in the main suite and 19 in the CI matrix;
+      # move the dev baseline deliberately, not via an automated bump
+      - dependency-name: react
+        update-types: ['version-update:semver-major']
+      - dependency-name: react-dom
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@types/react'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@types/react-dom'
+        update-types: ['version-update:semver-major']
+      # Playwright must match the Chromium build installed in CI; bump it on purpose
+      - dependency-name: playwright
+        update-types: ['version-update:semver-major', 'version-update:semver-minor']
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ['*']
