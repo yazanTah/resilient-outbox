@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Development tooling: Jest 30, tsup 9, GitHub Actions v7. No change to the published library.
+
 ## [1.0.0] - first public release
 
 ### Added

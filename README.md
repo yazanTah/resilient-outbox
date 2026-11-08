@@ -3,7 +3,7 @@
 [![CI](https://github.com/yazanTah/resilient-outbox/actions/workflows/ci.yml/badge.svg)](https://github.com/yazanTah/resilient-outbox/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/resilient-outbox.svg)](https://www.npmjs.com/package/resilient-outbox)
 [![types](https://img.shields.io/npm/types/resilient-outbox.svg)](https://www.npmjs.com/package/resilient-outbox)
-[![license](https://img.shields.io/npm/l/resilient-outbox.svg)](./LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 A durable offline mutation queue for **React Native, Expo and the web**. It gives every write an idempotency key, runs dependent writes in order while swapping temporary client IDs for server IDs, and moves permanent failures into a dead-letter queue so they never block anything else.
 
