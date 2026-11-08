@@ -1,4 +1,9 @@
-import { calculateBackoffMs, isDefaultRetryable } from '../../src/utils/backoff.js';
+import {
+  calculateBackoffMs,
+  getErrorRetryAfterMs,
+  getErrorStatusCode,
+  isDefaultRetryable
+} from '../../src/utils/backoff.js';
 
 describe('Backoff & Status Code Classification', () => {
   describe('calculateBackoffMs', () => {
@@ -64,6 +69,39 @@ describe('Backoff & Status Code Classification', () => {
       expect(isDefaultRetryable(new Error('Network request failed'))).toBe(true);
       expect(isDefaultRetryable(new Error('Connection timeout'))).toBe(true);
       expect(isDefaultRetryable(new Error('read ECONNRESET'))).toBe(true);
+    });
+  });
+
+  describe('isDefaultRetryable edge cases', () => {
+    test('408 and 425 retry; 501 and 505 are permanent', () => {
+      expect(isDefaultRetryable(null, 408)).toBe(true);
+      expect(isDefaultRetryable(null, 425)).toBe(true);
+      expect(isDefaultRetryable(null, 501)).toBe(false);
+      expect(isDefaultRetryable(null, 505)).toBe(false);
+      expect(isDefaultRetryable(null, 302)).toBe(true);
+    });
+  });
+
+  describe('getErrorStatusCode', () => {
+    test('reads statusCode, status and response.status', () => {
+      expect(getErrorStatusCode({ statusCode: 500 })).toBe(500);
+      expect(getErrorStatusCode({ status: 404 })).toBe(404);
+      expect(getErrorStatusCode({ response: { status: 401 } })).toBe(401);
+      expect(getErrorStatusCode({ status: '404' })).toBeUndefined();
+      expect(getErrorStatusCode({ status: NaN })).toBeUndefined();
+      expect(getErrorStatusCode(null)).toBeUndefined();
+      expect(getErrorStatusCode('500')).toBeUndefined();
+    });
+  });
+
+  describe('getErrorRetryAfterMs', () => {
+    test('accepts finite non-negative numbers only', () => {
+      expect(getErrorRetryAfterMs({ retryAfterMs: 5000 })).toBe(5000);
+      expect(getErrorRetryAfterMs({ retryAfterMs: 0 })).toBe(0);
+      expect(getErrorRetryAfterMs({ retryAfterMs: -1 })).toBeUndefined();
+      expect(getErrorRetryAfterMs({ retryAfterMs: Infinity })).toBeUndefined();
+      expect(getErrorRetryAfterMs({})).toBeUndefined();
+      expect(getErrorRetryAfterMs(undefined)).toBeUndefined();
     });
   });
 });

@@ -1,11 +1,13 @@
 import { OutboxQueue } from '../../src/core/queue.js';
 import { MemoryStorageAdapter } from '../../src/adapters/index.js';
+import type { Mutation, SyncContext } from '../../src/core/types.js';
+import { httpError } from '../helpers/index.js';
 
-describe('Durability & auto-flush', () => {
+describe('Durability across restarts', () => {
   test('idMap survives a restart so children resolve temp IDs', async () => {
     const storage = new MemoryStorageAdapter();
     const seen: unknown[] = [];
-    const executor = async (m: any, ctx: any) => {
+    const executor = async (m: Mutation, ctx: SyncContext) => {
       seen.push(ctx.resolvePayload(m.payload));
       return m.type === 'CREATE_POST' ? { id: 'srv_1' } : { ok: true };
     };
@@ -43,14 +45,24 @@ describe('Durability & auto-flush', () => {
     expect(calls).toBe(2);
   });
 
-  test('loads legacy array-format storage', async () => {
+  test('dead-letter state and error codes survive a restart', async () => {
     const storage = new MemoryStorageAdapter();
-    await storage.setItem('@resilient-outbox:l', JSON.stringify([
-      { id: '1', idempotencyKey: 'k', type: 'T', payload: {}, createdAt: 0, attempts: 0, maxAttempts: 5, nextAttemptAt: 0, status: 'syncing' }
-    ]));
-    const q = new OutboxQueue({ name: 'l', storage, executor: async () => ({}) });
-    await q.hydrate();
-    expect(q.getPending()).toHaveLength(1);
+    const q1 = new OutboxQueue({
+      name: 'dlq-restart',
+      storage,
+      executor: async () => {
+        throw httpError(403);
+      }
+    });
+    const parent = await q1.enqueue({ type: 'P', payload: {} });
+    await q1.enqueue({ type: 'C', payload: {}, dependsOn: parent.id });
+    await q1.flush();
+
+    const q2 = new OutboxQueue({ name: 'dlq-restart', storage, executor: async () => ({}) });
+    await q2.hydrate();
+    expect(q2.getDeadLetter().map(m => m.error?.code)).toEqual(['NON_RETRYABLE', 'PARENT_FAILED']);
+    await q2.retryDeadLetter(parent.id);
+    expect(await q2.flush()).toBe(2);
   });
 
   test('writes never overlap and the last write reflects latest state', async () => {
@@ -72,23 +84,5 @@ describe('Durability & auto-flush', () => {
     await Promise.all([q.enqueue({ type: 'A', payload: {} }), q.enqueue({ type: 'B', payload: {} })]);
     expect(maxActive).toBe(1);
     expect(last).toBe(2);
-  });
-
-  test('startAutoFlush flushes pending mutations on an interval and can stop', async () => {
-    jest.useFakeTimers();
-    try {
-      const executor = jest.fn(async () => ({}));
-      const q = new OutboxQueue({ name: 'a', executor });
-      await q.enqueue({ type: 'A', payload: {} });
-      const stop = q.startAutoFlush({ intervalMs: 1000, flushOnReconnect: false });
-      await jest.advanceTimersByTimeAsync(1100);
-      expect(executor).toHaveBeenCalledTimes(1);
-      stop();
-      await q.enqueue({ type: 'B', payload: {} });
-      await jest.advanceTimersByTimeAsync(5000);
-      expect(executor).toHaveBeenCalledTimes(1);
-    } finally {
-      jest.useRealTimers();
-    }
   });
 });

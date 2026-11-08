@@ -17,7 +17,7 @@ describe('OutboxQueue Core Test Suite', () => {
       const queue = new OutboxQueue({
         name: 'test-fifo',
         storage,
-        executor: async (mutation) => {
+        executor: async mutation => {
           executedOrder.push(mutation.type);
           idempotencyKeys.push(mutation.idempotencyKey);
           return { ok: true };
@@ -99,7 +99,7 @@ describe('OutboxQueue Core Test Suite', () => {
       const queue = new OutboxQueue({
         name: 'test-dlq',
         storage,
-        executor: async (mutation) => {
+        executor: async mutation => {
           if (mutation.type === 'BAD_MUTATION') {
             const err = new Error('Validation Failed: Invalid Email');
             (err as { statusCode?: number }).statusCode = 422;
@@ -150,7 +150,9 @@ describe('OutboxQueue Core Test Suite', () => {
 
           if (mutation.type === 'CREATE_COMMENT') {
             // Resolve temporary IDs in payload
-            const resolvedPayload = context.resolvePayload(mutation.payload as { postId: string; text: string });
+            const resolvedPayload = context.resolvePayload(
+              mutation.payload as { postId: string; text: string }
+            );
             const commentId = 'comment_srv_1111';
             commentsDatabase[commentId] = { id: commentId, ...resolvedPayload };
             return { id: commentId };
@@ -190,7 +192,7 @@ describe('OutboxQueue Core Test Suite', () => {
       const queue = new OutboxQueue({
         name: 'test-parent-fail',
         storage,
-        executor: async (mutation) => {
+        executor: async mutation => {
           if (mutation.type === 'PARENT') {
             const err = new Error('Unauthorized');
             (err as { statusCode?: number }).statusCode = 401;
@@ -221,7 +223,7 @@ describe('OutboxQueue Core Test Suite', () => {
         executor: async () => {
           executionCount++;
           // Simulate network latency
-          await new Promise((resolve) => setTimeout(resolve, 50));
+          await new Promise(resolve => setTimeout(resolve, 50));
           return { ok: true };
         }
       });

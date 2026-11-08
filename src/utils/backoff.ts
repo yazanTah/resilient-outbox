@@ -1,6 +1,6 @@
 /**
  * Calculates exponential backoff delay with optional full jitter.
- * Formula: min(maxMs, initialMs * (multiplier ^ attempt)) * (jitter ? random() : 1)
+ * Formula: min(maxMs, initialMs * multiplier^(attempt - 1)) * (jitter ? random() : 1)
  */
 export function calculateBackoffMs(
   attempt: number,
@@ -18,32 +18,43 @@ export function calculateBackoffMs(
   return Math.round(Math.random() * rawBackoff);
 }
 
+/** HTTP status codes that are 4xx/5xx but worth retrying. */
+const RETRYABLE_4XX = new Set([408, 425, 429]);
+/** 5xx codes that will not succeed on retry. */
+const PERMANENT_5XX = new Set([501, 505]);
+
 /**
  * Standard classification for HTTP and network errors:
- * - 4xx errors are client errors and non-retryable (quarantined to Dead-Letter Queue).
- * - 429 Too Many Requests is retryable.
- * - 5xx errors and network failures (status 0 / undefined) are retryable.
+ * - 408 Request Timeout, 425 Too Early and 429 Too Many Requests are retryable.
+ * - Other 4xx errors are client errors and non-retryable (quarantined to the Dead-Letter Queue).
+ * - 5xx errors are retryable, except 501 Not Implemented and 505 HTTP Version Not Supported.
+ * - Errors without a status code (network drops, timeouts, aborted connections) are retryable.
  */
-export function isDefaultRetryable(error: unknown, statusCode?: number): boolean {
-  if (statusCode !== undefined) {
-    if (statusCode === 429) return true; // Rate limit
-    if (statusCode >= 400 && statusCode < 500) return false; // Client errors -> DLQ
-    if (statusCode >= 500) return true; // Server errors -> retry
-  }
-
-  // Network drops, timeout errors, connection aborts
-  if (error instanceof Error) {
-    const msg = error.message.toLowerCase();
-    if (
-      msg.includes('network') ||
-      msg.includes('timeout') ||
-      msg.includes('failed to fetch') ||
-      msg.includes('econnreset') ||
-      msg.includes('econnrefused')
-    ) {
-      return true;
-    }
-  }
-
+export function isDefaultRetryable(_error: unknown, statusCode?: number): boolean {
+  if (statusCode === undefined) return true;
+  if (RETRYABLE_4XX.has(statusCode)) return true;
+  if (statusCode >= 400 && statusCode < 500) return false;
+  if (PERMANENT_5XX.has(statusCode)) return false;
   return true;
+}
+
+/**
+ * Extracts an HTTP status code from common error shapes:
+ * `err.statusCode`, `err.status` (fetch wrappers, ky) and `err.response.status` (axios).
+ */
+export function getErrorStatusCode(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const e = error as { statusCode?: unknown; status?: unknown; response?: { status?: unknown } };
+  const candidate = e.statusCode ?? e.status ?? e.response?.status;
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : undefined;
+}
+
+/**
+ * Reads a server-requested retry delay from `err.retryAfterMs`, if the executor provided one
+ * (e.g. parsed from a `Retry-After` header).
+ */
+export function getErrorRetryAfterMs(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const value = (error as { retryAfterMs?: unknown }).retryAfterMs;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
