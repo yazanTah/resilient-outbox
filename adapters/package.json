@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "main": "../dist/adapters/index.js",
+  "module": "../dist/adapters/index.mjs",
+  "types": "../dist/adapters/index.d.ts"
+}

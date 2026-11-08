@@ -1,0 +1,37 @@
+name: Bug report
+description: Something behaves differently from the documentation
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the mutation state (`queue.getAll()`) and any `dead_letter` error codes if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A failing test or a short snippet using `MemoryStorageAdapter` is ideal.
+      render: ts
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: resilient-outbox version
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Runtime
+      placeholder: e.g. React Native 0.81 (Hermes), Expo SDK 54, Chrome 140, Node 22
+    validations:
+      required: true
+  - type: input
+    id: storage
+    attributes:
+      label: Storage adapter
+      placeholder: e.g. AsyncStorage, MMKV v4, localStorage
