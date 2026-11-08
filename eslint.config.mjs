@@ -9,7 +9,7 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        projectService: { allowDefaultProject: ['*.js', '*.mjs'] },
+        projectService: { allowDefaultProject: ['*.js', '*.mjs', 'e2e/*.mjs'] },
         tsconfigRootDir: import.meta.dirname
       }
     },
@@ -48,8 +48,19 @@ export default tseslint.config(
     }
   },
   {
-    files: ['*.js', '*.mjs'],
+    files: ['**/*.js', '**/*.mjs'],
     ...tseslint.configs.disableTypeChecked,
-    languageOptions: { globals: { module: 'writable', require: 'readonly' } }
+    languageOptions: {
+      globals: {
+        module: 'writable',
+        require: 'readonly',
+        process: 'readonly',
+        console: 'readonly',
+        window: 'readonly',
+        localStorage: 'readonly',
+        setTimeout: 'readonly',
+        URL: 'readonly'
+      }
+    }
   }
 );

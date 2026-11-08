@@ -23,6 +23,14 @@ All notable changes to this project are documented here. The format follows
   the earliest backoff expires.
 - Lifecycle events via `on()`: `enqueued`, `completed`, `retry`, `dead_letter`, `storage_error`.
 - Configurable `logger` (or `null` to silence).
+- **Multi-tab support** via `crossTab: true`: every change is a locked read-modify-write of
+  storage (Web Locks), tabs elect a single leader that executes mutations, leadership fails over
+  when the leader's tab closes or crashes (in-flight work is retried with the same idempotency
+  key), and all tabs stay in sync over `BroadcastChannel`. `flush()` in a follower delegates to the
+  leader. Pluggable through the `OutboxCoordinator` interface; `MemoryCoordinator` is included.
+- Warning when two instances share a storage key without `crossTab`.
+- `snapshot.isLeader`.
+- End-to-end tests in real Chromium tabs (`npm run test:e2e`).
 - React: `useOutbox` (re-renders only when counts change, stable actions) and `useOutboxMutations`.
 - Adapters: `MemoryStorageAdapter`, `GenericStorageAdapter` (AsyncStorage, localStorage) and
   `MMKVStorageAdapter` (react-native-mmkv v3 and v4).

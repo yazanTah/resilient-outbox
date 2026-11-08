@@ -7,17 +7,18 @@
 
 A durable offline mutation queue for **React Native, Expo and the web**. It gives every write an idempotency key, runs dependent writes in order while swapping temporary client IDs for server IDs, and moves permanent failures into a dead-letter queue so they never block anything else.
 
-Zero runtime dependencies. Typed end to end. About 1,300 lines of heavily commented source you can read in one sitting.
+Zero runtime dependencies. Typed end to end. Under 1,900 lines of heavily commented source you can read in an afternoon.
 
 ---
 
 ## Why
 
-Offline writes fail in three ways that naive retry loops get wrong:
+Offline writes fail in four ways that naive retry loops get wrong:
 
 1. **Duplicates on flaky networks.** The request reaches the server, the response is lost, the client retries, and the user is charged twice. → Every mutation carries a stable `idempotencyKey` across retries and app restarts.
 2. **Writes that depend on each other.** A comment is created offline for a post that was _also_ created offline, so it references `temp_123`. → `dependsOn` holds the comment until the post succeeds, then `resolvePayload` rewrites `temp_123` to the real server ID — even if the app was killed in between.
-3. **Poison pills.** A `422` will never succeed, and a queue that retries it forever blocks every action behind it. → Permanent errors go straight to the dead-letter queue, together with anything that depended on them, and can be retried later in one call.
+3. **Two tabs, one queue.** Two open tabs that each keep their own copy of the queue silently overwrite each other's writes and send everything twice. → `crossTab: true` makes every change an atomic, locked read-modify-write and elects one tab to send, with automatic failover when it closes.
+4. **Poison pills.** A `422` will never succeed, and a queue that retries it forever blocks every action behind it. → Permanent errors go straight to the dead-letter queue, together with anything that depended on them, and can be retried later in one call.
 
 ## Install
 
@@ -179,6 +180,7 @@ Every dead-lettered mutation records why in `mutation.error.code`:
 - **Ordering.** Mutations are executed one at a time in FIFO order. A failing mutation doesn't block later _independent_ ones; use `dependsOn` wherever order matters.
 - **Durability.** State is saved after every mutation finishes. Writes are serialized and coalesced, so storage I/O stays bounded however fast state changes, and a write can never land out of order.
 - **No silent overwrite.** If storage can't be read at startup, nothing is written until a later read succeeds and is merged in. Unparseable data is backed up to `<key>:corrupt` before the queue continues.
+- **Multi-tab safety** (with `crossTab`). Changes from any tab are atomic, exactly one tab sends at a time, and leadership fails over when that tab dies.
 - **Single flight.** Concurrent `flush()` calls share one run. A call made during a run schedules one more pass, so work enqueued mid-flush is picked up.
 
 ### Server contract
@@ -198,6 +200,30 @@ app.post('/:resource', async (req, res) => {
 ```
 
 ---
+
+## Multiple tabs
+
+Open the same app in two tabs and, by default, each tab keeps its own copy of the queue in memory: their writes overwrite each other, and both send the same mutations. Turn on `crossTab` in every tab:
+
+```ts
+const outbox = new OutboxQueue({
+  name: 'api',
+  storage: new GenericStorageAdapter(localStorage),
+  crossTab: true,
+  executor
+});
+outbox.startAutoFlush(); // in every tab: whichever tab leads keeps the queue moving
+```
+
+- **No lost writes.** Every change — from any tab — is a read-modify-write of storage under a [Web Lock](https://developer.mozilla.org/docs/Web/API/Web_Locks_API), so tabs can never overwrite each other.
+- **One sender.** Tabs elect a leader, and only the leader executes mutations. `flush()` in another tab asks the leader to flush and resolves with its count.
+- **Failover.** When the leader tab closes or crashes, the browser releases its lock and the next tab takes over within milliseconds, retrying whatever was in flight with the **same idempotency key**.
+- **Every tab stays live.** Tabs are notified over `BroadcastChannel`, so `useOutbox` in any tab reflects enqueues, progress and failures from all of them. `snapshot.isLeader` tells you which tab is sending.
+- **Misconfiguration is caught.** If two instances share a storage key without `crossTab`, both log a warning.
+
+Execution events (`completed`, `retry`, `dead_letter`) fire in the leader's tab. This behaviour is verified end to end in real Chromium tabs in CI (`npm run test:e2e`).
+
+Running several queues in one JavaScript context, or on a platform without Web Locks? Share a `MemoryCoordinator` between them, or implement the three-method `OutboxCoordinator` interface yourself.
 
 ## Storage adapters
 
@@ -244,37 +270,39 @@ Events: `enqueued`, `completed`, `retry`, `dead_letter`, `storage_error`. Each `
 | `getServerId`       | `result => result.id`  | Extracts the server ID that a `tempId` maps to.                                                                               |
 | `idMapTtlMs`        | 7 days                 | Unused temp-ID mappings are dropped after this, unless a queued mutation still references them.                               |
 | `autoPersist`       | `true`                 | Set `false` to keep state in memory only.                                                                                     |
+| `crossTab`          | `false`                | `true` to coordinate browser tabs (see [Multiple tabs](#multiple-tabs)), or a custom `OutboxCoordinator`.                     |
 | `logger`            | `console`              | `{ warn, error }`, or `null` to silence.                                                                                      |
 
 The executor `context` has `resolvePayload(payload)`, `resolveId(id)`, a read-only `idMap`, and an `AbortSignal` in `signal`.
 
 ### Methods
 
-| Method                                                                           | Description                                                                                        |
-| :------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
-| `enqueue({ type, payload, tempId?, dependsOn?, idempotencyKey?, maxAttempts? })` | Adds a mutation and persists it. Resolves with the `Mutation`.                                     |
-| `flush()`                                                                        | Runs every due mutation. Resolves with the number completed.                                       |
-| `startAutoFlush(options?)`                                                       | `{ intervalMs = 15000, flushOnReconnect = true, flushOnEnqueue = true }`. Returns a stop function. |
-| `stopAutoFlushing()`                                                             | Stops auto-flush.                                                                                  |
-| `retryDeadLetter(id)`                                                            | Moves a mutation, and the descendants it took down with it, back to pending.                       |
-| `retryAllDeadLetter()`                                                           | Moves every dead-lettered mutation back to pending. Resolves with the count.                       |
-| `remove(id)`                                                                     | Removes a mutation (`false` if it is mid-request). Dependents get `PARENT_REMOVED`.                |
-| `clear()`                                                                        | Removes everything, including temp-ID mappings.                                                    |
-| `get(id)`, `getAll()`, `getPending()`, `getDeadLetter()`                         | Synchronous reads.                                                                                 |
-| `on(event, listener)`                                                            | Subscribes to a lifecycle event.                                                                   |
-| `subscribe(listener)`                                                            | Low-level change notifications (used by the hooks).                                                |
-| `getSnapshot()`                                                                  | `{ total, pending, syncing, deadLetter, isSyncing, isHydrated }`, stable until a value changes.    |
-| `getMutationsSnapshot()`                                                         | Shallow copies of all mutations, stable until the queue changes.                                   |
-| `hydrate()`                                                                      | Loads persisted state. Idempotent; called automatically.                                           |
-| `destroy()`                                                                      | Stops timers, aborts the in-flight request without using up an attempt, and drops listeners.       |
+| Method                                                                           | Description                                                                                               |
+| :------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------- |
+| `enqueue({ type, payload, tempId?, dependsOn?, idempotencyKey?, maxAttempts? })` | Adds a mutation and persists it. Resolves with the `Mutation`.                                            |
+| `flush()`                                                                        | Runs every due mutation. Resolves with the number completed.                                              |
+| `startAutoFlush(options?)`                                                       | `{ intervalMs = 15000, flushOnReconnect = true, flushOnEnqueue = true }`. Returns a stop function.        |
+| `stopAutoFlushing()`                                                             | Stops auto-flush.                                                                                         |
+| `retryDeadLetter(id)`                                                            | Moves a mutation, and the descendants it took down with it, back to pending.                              |
+| `retryAllDeadLetter()`                                                           | Moves every dead-lettered mutation back to pending. Resolves with the count.                              |
+| `remove(id)`                                                                     | Removes a mutation (`false` if it is mid-request). Dependents get `PARENT_REMOVED`.                       |
+| `clear()`                                                                        | Removes everything, including temp-ID mappings.                                                           |
+| `get(id)`, `getAll()`, `getPending()`, `getDeadLetter()`                         | Synchronous reads.                                                                                        |
+| `on(event, listener)`                                                            | Subscribes to a lifecycle event.                                                                          |
+| `subscribe(listener)`                                                            | Low-level change notifications (used by the hooks).                                                       |
+| `getSnapshot()`                                                                  | `{ total, pending, syncing, deadLetter, isSyncing, isHydrated, isLeader }`, stable until a value changes. |
+| `getMutationsSnapshot()`                                                         | Shallow copies of all mutations, stable until the queue changes.                                          |
+| `hydrate()`                                                                      | Loads persisted state. Idempotent; called automatically.                                                  |
+| `destroy()`                                                                      | Stops timers, aborts the in-flight request without using up an attempt, and drops listeners.              |
 
-Also exported: `MutationErrorCode`, `OutboxTimeoutError`, `OutboxDestroyedError`, `calculateBackoffMs`, `isDefaultRetryable`, `getErrorStatusCode`, `generateUUID`, and every type.
+Also exported: `MemoryCoordinator`, `createWebCoordinator`, `isWebCoordinatorSupported`, `MutationErrorCode`, `OutboxTimeoutError`, `OutboxDestroyedError`, `calculateBackoffMs`, `isDefaultRetryable`, `getErrorStatusCode`, `generateUUID`, and every type.
 
 ---
 
 ## Limitations
 
-- **One writer per storage key.** Two `OutboxQueue` instances with the same `name` — including the same queue open in two browser tabs — will overwrite each other's state. On the web, use a single tab or give each tab its own `name`.
+- **Use `crossTab: true` on the web.** Without it, two instances sharing a storage key — the same app in two tabs — overwrite each other (the library warns in the console when it detects this). With it, `crossTab` needs the Web Locks API and `BroadcastChannel` (Chrome/Edge 69+, Firefox 96+, Safari 15.4+); elsewhere it logs a warning and runs as a single instance.
+- **Cross-tab writes cost a storage round-trip each.** Every change is a locked read-modify-write of the whole queue, which is instant for `localStorage` and typical queue sizes, but not designed for tens of thousands of queued mutations.
 - **Payloads and results must be JSON-serializable**, because that is how they are persisted.
 - **Everything is held in memory.** Fine for thousands of mutations, not millions.
 - **Idempotency keys need good randomness.** On runtimes without Web Crypto (e.g. older Hermes builds) IDs fall back to `Math.random`. Install `react-native-get-random-values` there.

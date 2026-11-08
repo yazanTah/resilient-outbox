@@ -14,6 +14,8 @@ import type {
   RetryConfig,
   SyncContext
 } from './types.js';
+import type { OutboxChannel, OutboxCoordinator } from './coordinator.js';
+import { createWebCoordinator } from './coordinator.js';
 import { OutboxDestroyedError, OutboxTimeoutError } from './errors.js';
 import { generateUUID } from '../utils/id.js';
 import {
@@ -26,6 +28,9 @@ import { MemoryStorageAdapter } from '../adapters/index.js';
 
 const STORAGE_VERSION = 2;
 const DEFAULT_ID_MAP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** How long a follower waits for the leader to answer a `flush()` request. */
+const FOLLOWER_FLUSH_TIMEOUT_MS = 30_000;
+const MESSAGE_SOURCE = 'resilient-outbox';
 
 type IdMapEntry = [tempId: string, serverId: unknown, lastUsedAt?: number];
 
@@ -39,6 +44,24 @@ interface AutoFlushState {
   options: Required<AutoFlushOptions>;
   stop: () => void;
   wakeTimer?: ReturnType<typeof setTimeout>;
+}
+
+type ExecutionOutcome = { ok: true; result: unknown } | { ok: false; error: unknown };
+type ClaimResult = 'claimed' | 'skipped' | 'cascaded';
+
+interface ChannelMessage {
+  source: typeof MESSAGE_SOURCE;
+  from: string;
+  type: 'hello' | 'hello-ack' | 'changed' | 'flush-request' | 'flush-result';
+  id?: string;
+  count?: number;
+}
+
+interface TransactOptions<T> {
+  /** Whether the change must be written to storage. Default `true`. */
+  write?: boolean | ((result: T) => boolean);
+  /** Allowed after `destroy()`, to record the outcome of an aborted in-flight request. */
+  internal?: boolean;
 }
 
 function isMutationLike(value: unknown): value is Mutation {
@@ -100,6 +123,7 @@ export class OutboxQueue {
   private readonly logger: OutboxLogger | null;
 
   private mutations: Mutation[] = [];
+  private index: Map<string, Mutation> | null = null;
   /** Mutations removed while a flush may still hold a reference to them. */
   private removed = new WeakSet<Mutation>();
   private idMap = new Map<string, unknown>();
@@ -119,6 +143,16 @@ export class OutboxQueue {
   private persistChain: Promise<void> = Promise.resolve();
   private writeQueued = false;
 
+  // Cross-tab coordination
+  private readonly instanceId = generateUUID();
+  private readonly coordinator: OutboxCoordinator | undefined;
+  private channel: OutboxChannel | undefined;
+  private releaseLeadership: (() => void) | undefined;
+  private isLeader: boolean;
+  private flushRequests = new Map<string, (count: number) => void>();
+  private followerFlush: Promise<number> | null = null;
+  private warnedAboutInstances = false;
+
   private autoFlush: AutoFlushState | null = null;
   private destroyed = false;
   private readonly destroyController = new AbortController();
@@ -128,14 +162,7 @@ export class OutboxQueue {
     version: -1,
     value: []
   };
-  private currentSnapshot: QueueStateSnapshot = {
-    total: 0,
-    pending: 0,
-    syncing: 0,
-    deadLetter: 0,
-    isSyncing: false,
-    isHydrated: false
-  };
+  private currentSnapshot: QueueStateSnapshot;
 
   constructor(options: OutboxQueueOptions) {
     // Runtime validation for JavaScript callers
@@ -165,6 +192,36 @@ export class OutboxQueue {
       jitter: options.retryConfig?.jitter ?? true,
       isRetryable: options.retryConfig?.isRetryable ?? isDefaultRetryable
     };
+
+    const crossTab = options.crossTab ?? false;
+    this.coordinator = crossTab === true ? createWebCoordinator() : crossTab || undefined;
+    if (crossTab === true && !this.coordinator) {
+      this.logger?.warn(
+        `[resilient-outbox:${this.name}] crossTab requires the Web Locks API and BroadcastChannel, ` +
+          'which this runtime lacks. Running as a single instance.'
+      );
+    }
+    this.isLeader = !this.coordinator;
+    this.currentSnapshot = {
+      total: 0,
+      pending: 0,
+      syncing: 0,
+      deadLetter: 0,
+      isSyncing: false,
+      isHydrated: false,
+      isLeader: this.isLeader
+    };
+
+    if (this.coordinator) {
+      this.channel = this.coordinator.openChannel(this.storageKey, message => {
+        this.onChannelMessage(message);
+      });
+      this.releaseLeadership = this.coordinator.requestLeadership(`${this.storageKey}:leader`, () => {
+        void this.onBecomeLeader();
+      });
+    } else {
+      this.detectOtherInstances(options.storage !== undefined);
+    }
   }
 
   get storageKey(): string {
@@ -173,6 +230,10 @@ export class OutboxQueue {
 
   get hydrated(): boolean {
     return this.isHydrated;
+  }
+
+  private get mutexName(): string {
+    return `${this.storageKey}:mutex`;
   }
 
   // --- Hydration & Persistence ---
@@ -196,7 +257,11 @@ export class OutboxQueue {
 
   private async loadFromStorage(): Promise<void> {
     try {
-      await this.mergeFromStorage();
+      if (this.coordinator) {
+        await this.coordinator.withLock(this.mutexName, () => this.syncFromStorage());
+      } else {
+        await this.mergeFromStorage();
+      }
     } catch (err) {
       this.reportStorageError('hydrate', err);
     } finally {
@@ -206,43 +271,52 @@ export class OutboxQueue {
   }
 
   /**
-   * Reads storage and merges it into memory. Throws only if the read itself fails, in which
-   * case writes are held back until a later read succeeds, so unread data is never overwritten.
-   * Corrupt data is backed up to `<storageKey>:corrupt` and then ignored.
+   * Reads and parses storage. Throws if the read fails. Corrupt data is backed up to
+   * `<storageKey>:corrupt`, reported, and treated as an empty queue.
+   */
+  private async readState(): Promise<Pick<PersistedState, 'mutations' | 'idMap'> | null> {
+    const raw = await this.storage.getItem(this.storageKey);
+    if (!raw) return null;
+    try {
+      return parseState(raw);
+    } catch (err) {
+      await this.storage.setItem(`${this.storageKey}:corrupt`, raw).catch(() => undefined);
+      this.reportStorageError('hydrate', err);
+      return null;
+    }
+  }
+
+  private normalize(m: Mutation, resetSyncing: boolean): Mutation {
+    return {
+      ...m,
+      attempts: typeof m.attempts === 'number' ? m.attempts : 0,
+      maxAttempts: typeof m.maxAttempts === 'number' ? m.maxAttempts : this.retryConfig.maxAttempts,
+      nextAttemptAt: typeof m.nextAttemptAt === 'number' ? m.nextAttemptAt : 0,
+      // If the app was killed mid-request, the request may or may not have reached the server.
+      // Replaying it is safe because it carries the same idempotency key.
+      status: resetSyncing && m.status === 'syncing' ? 'pending' : m.status
+    };
+  }
+
+  /**
+   * Single-instance mode: merges storage into memory. Throws only if the read itself fails, in
+   * which case writes are held back until a later read succeeds, so unread data is never lost.
    */
   private async mergeFromStorage(): Promise<void> {
-    let raw: string | null;
+    let state: Pick<PersistedState, 'mutations' | 'idMap'> | null;
     try {
-      raw = await this.storage.getItem(this.storageKey);
+      state = await this.readState();
     } catch (err) {
       this.needsRehydrate = true;
       throw err;
     }
     this.needsRehydrate = false;
-    if (!raw) return;
-
-    let state: Pick<PersistedState, 'mutations' | 'idMap'>;
-    try {
-      state = parseState(raw);
-    } catch (err) {
-      await this.storage.setItem(`${this.storageKey}:corrupt`, raw).catch(() => undefined);
-      this.reportStorageError('hydrate', err);
-      return;
-    }
+    if (!state) return;
 
     const known = new Set(this.mutations.map(m => m.id));
-    const restored = state.mutations
-      .filter(m => !known.has(m.id))
-      .map((m): Mutation => ({
-        ...m,
-        attempts: typeof m.attempts === 'number' ? m.attempts : 0,
-        maxAttempts: typeof m.maxAttempts === 'number' ? m.maxAttempts : this.retryConfig.maxAttempts,
-        nextAttemptAt: typeof m.nextAttemptAt === 'number' ? m.nextAttemptAt : 0,
-        // If the app was killed mid-request, the request may or may not have reached the
-        // server. Replaying it is safe because it carries the same idempotency key.
-        status: m.status === 'syncing' ? 'pending' : m.status
-      }));
+    const restored = state.mutations.filter(m => !known.has(m.id)).map(m => this.normalize(m, true));
     this.mutations = [...restored, ...this.mutations];
+    this.index = null;
 
     const now = Date.now();
     for (const [tempId, serverId, lastUsedAt] of state.idMap) {
@@ -254,10 +328,84 @@ export class OutboxQueue {
   }
 
   /**
-   * Schedules a write of the current state. Writes are serialized, and while one write is
-   * waiting its turn, further calls share it: the state is serialized when the write starts,
-   * so it always contains every change made before it. This bounds storage I/O to at most one
-   * in-flight and one queued write no matter how fast state changes.
+   * Cross-tab mode: storage is the source of truth, so memory is replaced by it. Objects that
+   * already exist are updated in place, so references returned by `enqueue()` and `get()` stay
+   * live. Must be called while holding the mutex.
+   */
+  private async syncFromStorage(): Promise<void> {
+    const state = (await this.readState()) ?? { mutations: [], idMap: [] };
+
+    const local = new Map(this.mutations.map(m => [m.id, m]));
+    this.mutations = state.mutations.map(stored => {
+      const next = this.normalize(stored, false);
+      const existing = local.get(next.id);
+      if (!existing) return next;
+      local.delete(next.id);
+      for (const key of Object.keys(existing)) {
+        if (!(key in next)) Reflect.deleteProperty(existing, key);
+      }
+      return Object.assign(existing, next);
+    });
+    for (const gone of local.values()) this.removed.add(gone);
+    this.index = null;
+
+    const now = Date.now();
+    const previousLastUsed = this.idMapLastUsed;
+    this.idMap = new Map();
+    this.idMapLastUsed = new Map();
+    for (const [tempId, serverId, lastUsedAt] of state.idMap) {
+      this.idMap.set(tempId, serverId);
+      const stored = typeof lastUsedAt === 'number' ? lastUsedAt : now;
+      this.idMapLastUsed.set(tempId, Math.max(stored, previousLastUsed.get(tempId) ?? 0));
+    }
+  }
+
+  /**
+   * The single entry point for every state change.
+   *
+   * - Single instance: applies `fn` to memory, notifies, then schedules a coalesced write.
+   * - Cross-tab: under the shared mutex, re-reads storage, applies `fn`, writes, and tells the
+   *   other instances to refresh. A failed write rejects and memory is resynced from storage, so
+   *   a change is never reported as durable when it is not.
+   */
+  private async transact<T>(fn: () => T, options: TransactOptions<T> = {}): Promise<T> {
+    if (options.internal) await this.hydrate();
+    else await this.ready();
+
+    const shouldWrite = (result: T): boolean =>
+      typeof options.write === 'function' ? options.write(result) : options.write !== false;
+
+    const coordinator = this.coordinator;
+    if (!coordinator) {
+      const result = fn();
+      this.notify();
+      if (shouldWrite(result)) await this.persist();
+      return result;
+    }
+
+    return coordinator.withLock(this.mutexName, async () => {
+      await this.syncFromStorage();
+      const result = fn();
+      if (shouldWrite(result) && this.autoPersist) {
+        try {
+          await this.writeState();
+        } catch (err) {
+          this.reportStorageError('persist', err);
+          await this.syncFromStorage().catch(() => undefined);
+          this.notify();
+          throw err;
+        }
+        this.channel?.post(this.message('changed'));
+      }
+      this.notify();
+      return result;
+    });
+  }
+
+  /**
+   * Single-instance writes are serialized, and while one write is waiting its turn, further
+   * calls share it: the state is serialized when the write starts, so it always contains every
+   * change made before it. This bounds storage I/O to one in-flight and one queued write.
    */
   private persist(): Promise<void> {
     if (!this.autoPersist) return Promise.resolve();
@@ -276,17 +424,21 @@ export class OutboxQueue {
         await this.mergeFromStorage();
         this.notify();
       }
-      this.pruneIdMap();
-      const state: PersistedState = {
-        version: STORAGE_VERSION,
-        // Completed mutations are dropped so storage does not grow indefinitely
-        mutations: this.mutations.filter(m => m.status !== 'completed'),
-        idMap: Array.from(this.idMap.entries(), ([k, v]): IdMapEntry => [k, v, this.idMapLastUsed.get(k)])
-      };
-      await this.storage.setItem(this.storageKey, JSON.stringify(state));
+      await this.writeState();
     } catch (err) {
       this.reportStorageError('persist', err);
     }
+  }
+
+  private async writeState(): Promise<void> {
+    this.pruneIdMap();
+    const state: PersistedState = {
+      version: STORAGE_VERSION,
+      // Completed mutations are dropped so storage does not grow indefinitely
+      mutations: this.mutations.filter(m => m.status !== 'completed'),
+      idMap: Array.from(this.idMap.entries(), ([k, v]): IdMapEntry => [k, v, this.idMapLastUsed.get(k)])
+    };
+    await this.storage.setItem(this.storageKey, JSON.stringify(state));
   }
 
   /** Drops temp-ID mappings unused for `idMapTtlMs`, unless a queued mutation still references them. */
@@ -329,7 +481,6 @@ export class OutboxQueue {
     if (typeof raw?.type !== 'string' || raw.type.length === 0) {
       throw new TypeError('[resilient-outbox] `type` must be a non-empty string');
     }
-    await this.ready();
 
     const now = Date.now();
     const mutation: Mutation<TPayload, TResult> = {
@@ -348,10 +499,11 @@ export class OutboxQueue {
     if (mutation.tempId === undefined) delete mutation.tempId;
     if (mutation.dependsOn === undefined) delete mutation.dependsOn;
 
-    this.mutations.push(mutation);
-    this.notify();
+    await this.transact(() => {
+      this.mutations.push(mutation);
+      this.index = null;
+    });
     this.emit('enqueued', { mutation });
-    await this.persist();
 
     if (this.autoFlush?.options.flushOnEnqueue) {
       this.triggerAutoFlush();
@@ -359,8 +511,13 @@ export class OutboxQueue {
     return mutation;
   }
 
+  private findById(id: string): Mutation | undefined {
+    this.index ??= new Map(this.mutations.map(m => [m.id, m]));
+    return this.index.get(id);
+  }
+
   get(id: string): Mutation | undefined {
-    return this.mutations.find(m => m.id === id);
+    return this.findById(id);
   }
 
   getAll(): ReadonlyArray<Mutation> {
@@ -380,31 +537,38 @@ export class OutboxQueue {
    * Pending dependents of a removed, uncompleted mutation are moved to the Dead-Letter Queue with
    * code `PARENT_REMOVED`, because they would otherwise run against an entity that never existed.
    */
-  async remove(id: string): Promise<boolean> {
-    await this.ready();
-    const idx = this.mutations.findIndex(m => m.id === id);
-    if (idx === -1) return false;
-    const mutation = this.mutations[idx]!;
-    if (mutation.status === 'syncing') return false;
+  remove(id: string): Promise<boolean> {
+    return this.transact(
+      () => {
+        const idx = this.mutations.findIndex(m => m.id === id);
+        if (idx === -1) return false;
+        const mutation = this.mutations[idx]!;
+        if (mutation.status === 'syncing') return false;
 
-    this.mutations.splice(idx, 1);
-    this.removed.add(mutation);
-    if (mutation.status !== 'completed') {
-      this.cascadeDeadLetter(mutation.id, 'PARENT_REMOVED', `Parent mutation (${mutation.id}) was removed`);
-    }
-    this.notify();
-    await this.persist();
-    return true;
+        this.mutations.splice(idx, 1);
+        this.index = null;
+        this.removed.add(mutation);
+        if (mutation.status !== 'completed') {
+          this.cascadeDeadLetter(
+            mutation.id,
+            'PARENT_REMOVED',
+            `Parent mutation (${mutation.id}) was removed`
+          );
+        }
+        return true;
+      },
+      { write: removed => removed }
+    );
   }
 
-  async clear(): Promise<void> {
-    await this.ready();
-    for (const m of this.mutations) this.removed.add(m);
-    this.mutations = [];
-    this.idMap.clear();
-    this.idMapLastUsed.clear();
-    this.notify();
-    await this.persist();
+  clear(): Promise<void> {
+    return this.transact(() => {
+      for (const m of this.mutations) this.removed.add(m);
+      this.mutations = [];
+      this.index = null;
+      this.idMap.clear();
+      this.idMapLastUsed.clear();
+    });
   }
 
   /**
@@ -412,35 +576,37 @@ export class OutboxQueue {
    * dead-lettered only because of it (code `PARENT_FAILED`).
    */
   async retryDeadLetter(id: string): Promise<boolean> {
-    await this.ready();
-    const mutation = this.mutations.find(m => m.id === id && m.status === 'dead_letter');
-    if (!mutation) return false;
-
-    const now = Date.now();
-    this.revive(mutation, now);
-    this.reviveDescendants(mutation.id, now);
-
-    this.notify();
-    await this.persist();
-    this.triggerAutoFlush();
-    return true;
+    const revived = await this.transact(
+      () => {
+        const mutation = this.findById(id);
+        if (mutation?.status !== 'dead_letter') return false;
+        const now = Date.now();
+        this.revive(mutation, now);
+        this.reviveDescendants(mutation.id, now);
+        return true;
+      },
+      { write: r => r }
+    );
+    if (revived) this.triggerAutoFlush();
+    return revived;
   }
 
   async retryAllDeadLetter(): Promise<number> {
-    await this.ready();
-    const now = Date.now();
-    let count = 0;
-    for (const m of this.mutations) {
-      if (m.status === 'dead_letter') {
-        this.revive(m, now);
-        count++;
-      }
-    }
-    if (count > 0) {
-      this.notify();
-      await this.persist();
-      this.triggerAutoFlush();
-    }
+    const count = await this.transact(
+      () => {
+        const now = Date.now();
+        let n = 0;
+        for (const m of this.mutations) {
+          if (m.status === 'dead_letter') {
+            this.revive(m, now);
+            n++;
+          }
+        }
+        return n;
+      },
+      { write: n => n > 0 }
+    );
+    if (count > 0) this.triggerAutoFlush();
     return count;
   }
 
@@ -518,8 +684,11 @@ export class OutboxQueue {
    * one in-flight run; a call made during a run schedules one more pass so newly enqueued
    * mutations are picked up. Resolves with the number of mutations that completed.
    * No-op (resolves `0`) while `isOnline()` reports offline.
+   *
+   * With `crossTab`, a non-leader instance asks the leader to flush and resolves with its count.
    */
   flush(): Promise<number> {
+    if (this.coordinator && !this.isLeader) return this.requestLeaderFlush();
     if (this.activeFlushPromise) {
       this.rerunRequested = true;
       return this.activeFlushPromise;
@@ -569,35 +738,31 @@ export class OutboxQueue {
     const now = Date.now();
 
     try {
-      const byId = new Map(this.mutations.map(m => [m.id, m]));
-      const pending = this.mutations.filter(m => m.status === 'pending');
+      if (this.coordinator) {
+        // Pick up mutations other tabs enqueued since our last sync
+        await this.transact(() => undefined, { write: false, internal: true });
+      }
+      const candidates = this.mutations.filter(m => m.status === 'pending');
 
-      for (const mutation of pending) {
+      for (const mutation of candidates) {
         if (this.destroyed) break;
-        // State may have changed during this flush (cascaded, removed, cleared)
-        if (mutation.status !== 'pending' || this.removed.has(mutation)) continue;
-        if (mutation.nextAttemptAt > now) continue;
 
-        if (mutation.dependsOn) {
-          const parent = byId.get(mutation.dependsOn);
-          // A parent that is no longer in the queue completed in an earlier session and was purged
-          if (parent && !this.removed.has(parent)) {
-            if (parent.status === 'dead_letter') {
-              this.moveToDeadLetter(mutation, {
-                message: `Parent mutation (${parent.id}) failed in Dead-Letter Queue`,
-                code: 'PARENT_FAILED',
-                timestamp: Date.now()
-              });
-              continue;
-            }
-            if (parent.status !== 'completed') continue;
-          }
-        }
+        // Claim atomically; in cross-tab mode `syncing` is written so other tabs can see it
+        const claim = await this.transact(() => this.claim(mutation, now), {
+          internal: true,
+          write: c => c === 'cascaded' || (c === 'claimed' && this.coordinator !== undefined)
+        });
+        if (claim !== 'claimed') continue;
 
-        if (await this.execute(mutation)) syncedCount++;
-        this.notify();
+        const outcome = await this.execute(mutation);
         // Checkpoint after every mutation so a crash mid-flush loses no progress
-        await this.persist();
+        await this.transact(
+          () => {
+            this.applyOutcome(mutation, outcome);
+          },
+          { internal: true, write: () => !this.handedOver() }
+        );
+        if (outcome.ok) syncedCount++;
       }
     } finally {
       this.isSyncing = false;
@@ -607,12 +772,36 @@ export class OutboxQueue {
     return syncedCount;
   }
 
-  private async execute(mutation: Mutation): Promise<boolean> {
-    mutation.status = 'syncing';
-    this.notify();
+  private claim(mutation: Mutation, now: number): ClaimResult {
+    // State may have changed since the flush started (removed, cascaded, or edited by another tab)
+    if (mutation.status !== 'pending' || this.removed.has(mutation)) return 'skipped';
+    if (mutation.nextAttemptAt > now) return 'skipped';
 
+    if (mutation.dependsOn) {
+      // A parent that is no longer in the queue completed in an earlier session and was purged
+      const parent = this.findById(mutation.dependsOn);
+      if (parent) {
+        if (parent.status === 'dead_letter') {
+          this.moveToDeadLetter(mutation, {
+            message: `Parent mutation (${parent.id}) failed in Dead-Letter Queue`,
+            code: 'PARENT_FAILED',
+            timestamp: Date.now()
+          });
+          return 'cascaded';
+        }
+        if (parent.status !== 'completed') return 'skipped';
+      }
+    }
+
+    mutation.status = 'syncing';
+    return 'claimed';
+  }
+
+  private async execute(mutation: Mutation): Promise<ExecutionOutcome> {
     const controller = new AbortController();
-    const onDestroy = (): void => controller.abort();
+    const onDestroy = (): void => {
+      controller.abort();
+    };
     this.destroyController.signal.addEventListener('abort', onDestroy);
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -631,16 +820,29 @@ export class OutboxQueue {
               })
             ])
           : await execution;
-
-      this.handleSuccess(mutation, result);
-      return true;
-    } catch (err) {
-      this.handleFailure(mutation, err);
-      return false;
+      return { ok: true, result };
+    } catch (error) {
+      return { ok: false, error };
     } finally {
       clearTimeout(timer);
       this.destroyController.signal.removeEventListener('abort', onDestroy);
     }
+  }
+
+  /** After `destroy()` in cross-tab mode, the next leader owns whatever we had in flight. */
+  private handedOver(): boolean {
+    return this.destroyed && this.coordinator !== undefined;
+  }
+
+  private applyOutcome(mutation: Mutation, outcome: ExecutionOutcome): void {
+    if (this.handedOver()) return;
+    if (this.removed.has(mutation)) {
+      // Cleared while in flight: record the result on the object only, with no side effects
+      mutation.status = outcome.ok ? 'completed' : 'pending';
+      return;
+    }
+    if (outcome.ok) this.handleSuccess(mutation, outcome.result);
+    else this.handleFailure(mutation, outcome.error);
   }
 
   private handleSuccess(mutation: Mutation, result: unknown): void {
@@ -703,12 +905,169 @@ export class OutboxQueue {
     this.emit('retry', { mutation, error: err, delayMs });
   }
 
+  // --- Cross-tab coordination ---
+
+  private message(type: ChannelMessage['type'], extra: Partial<ChannelMessage> = {}): ChannelMessage {
+    return { source: MESSAGE_SOURCE, from: this.instanceId, type, ...extra };
+  }
+
+  private onChannelMessage(raw: unknown): void {
+    const msg = raw as Partial<ChannelMessage> | null;
+    if (msg?.source !== MESSAGE_SOURCE || msg.from === this.instanceId || this.destroyed) return;
+
+    switch (msg.type) {
+      case 'changed':
+        void this.refresh().then(() => {
+          if (this.autoFlush?.options.flushOnEnqueue) this.triggerAutoFlush();
+        });
+        break;
+      case 'flush-request':
+        if (this.isLeader) {
+          const id = msg.id;
+          void this.flush()
+            .catch(() => 0)
+            .then(count => {
+              this.channel?.post(this.message('flush-result', { id, count }));
+            });
+        }
+        break;
+      case 'flush-result': {
+        const resolve = msg.id === undefined ? undefined : this.flushRequests.get(msg.id);
+        if (resolve) {
+          this.flushRequests.delete(msg.id!);
+          resolve(typeof msg.count === 'number' ? msg.count : 0);
+        }
+        break;
+      }
+      case 'hello':
+      case 'hello-ack':
+        // An instance without `crossTab` shares our storage key
+        this.warnAboutOtherInstances();
+        break;
+    }
+  }
+
+  /** Re-reads storage after another instance changed it. */
+  private async refresh(): Promise<void> {
+    const coordinator = this.coordinator;
+    if (!coordinator) return;
+    try {
+      await coordinator.withLock(this.mutexName, () => this.syncFromStorage());
+      this.notify();
+    } catch (err) {
+      this.reportStorageError('hydrate', err);
+    }
+  }
+
+  private async onBecomeLeader(): Promise<void> {
+    if (this.destroyed) return;
+    this.isLeader = true;
+    try {
+      // Only the leader ever marks mutations `syncing`. If we just took over, the previous
+      // leader died mid-request: retry its in-flight mutations (same idempotency keys).
+      await this.transact(
+        () => {
+          let reset = 0;
+          for (const m of this.mutations) {
+            if (m.status === 'syncing') {
+              m.status = 'pending';
+              reset++;
+            }
+          }
+          return reset;
+        },
+        { write: reset => reset > 0 }
+      );
+    } catch (err) {
+      this.logger?.error(`[resilient-outbox:${this.name}] Failed to take over leadership:`, err);
+    }
+    this.notify();
+
+    if (this.flushRequests.size > 0) {
+      const waiting = [...this.flushRequests.values()];
+      this.flushRequests.clear();
+      const count = await this.flush().catch(() => 0);
+      for (const resolve of waiting) resolve(count);
+    }
+    this.triggerAutoFlush();
+  }
+
+  private requestLeaderFlush(): Promise<number> {
+    if (this.followerFlush) return this.followerFlush;
+    const run = (async (): Promise<number> => {
+      await this.ready();
+      const id = generateUUID();
+      return new Promise<number>(resolve => {
+        const timer = setTimeout(() => {
+          this.flushRequests.delete(id);
+          resolve(0);
+        }, FOLLOWER_FLUSH_TIMEOUT_MS);
+        unref(timer);
+        this.flushRequests.set(id, count => {
+          clearTimeout(timer);
+          resolve(count);
+        });
+        this.channel?.post(this.message('flush-request', { id }));
+      });
+    })().finally(() => {
+      this.followerFlush = null;
+    });
+    this.followerFlush = run;
+    return run;
+  }
+
+  /**
+   * Without `crossTab`, two instances on one storage key overwrite each other. In browsers, say
+   * hello on a BroadcastChannel and warn if another instance answers.
+   */
+  private detectOtherInstances(storageProvided: boolean): void {
+    const g = globalThis as {
+      document?: unknown;
+      BroadcastChannel?: new (name: string) => {
+        onmessage: ((event: { data: unknown }) => void) | null;
+        postMessage(message: unknown): void;
+        close(): void;
+        unref?: () => void;
+      };
+    };
+    if (!storageProvided || this.storage instanceof MemoryStorageAdapter) return;
+    if (g.document === undefined || typeof g.BroadcastChannel !== 'function') return;
+
+    const channel = new g.BroadcastChannel(this.storageKey);
+    channel.unref?.();
+    channel.onmessage = event => {
+      const msg = event.data as Partial<ChannelMessage> | null;
+      if (msg?.source !== MESSAGE_SOURCE || msg.from === this.instanceId || this.destroyed) return;
+      this.warnAboutOtherInstances();
+      if (msg.type === 'hello') channel.postMessage(this.message('hello-ack'));
+    };
+    channel.postMessage(this.message('hello'));
+    this.channel = {
+      post: m => {
+        channel.postMessage(m);
+      },
+      close: () => {
+        channel.close();
+      }
+    };
+  }
+
+  private warnAboutOtherInstances(): void {
+    if (this.warnedAboutInstances) return;
+    this.warnedAboutInstances = true;
+    this.logger?.warn(
+      `[resilient-outbox:${this.name}] Another OutboxQueue is using the same storage key (another tab?). ` +
+        'Enable `crossTab: true` on every instance to prevent lost updates and duplicate requests.'
+    );
+  }
+
   // --- Auto Flush ---
 
   /**
    * Flushes automatically: immediately, on an interval, after each enqueue, when the device
    * comes back online (where `online` events exist), and exactly when the earliest backoff
    * expires. Returns a function that stops it. Calling it again replaces the previous config.
+   * With `crossTab`, only the leader flushes; call this in every tab so failover keeps flushing.
    *
    * On React Native, also call `queue.flush()` from your AppState / NetInfo listeners, and pass
    * an `isOnline` option backed by NetInfo.
@@ -723,7 +1082,9 @@ export class OutboxQueue {
       flushOnEnqueue: options.flushOnEnqueue ?? true
     };
 
-    const tick = (): void => this.triggerAutoFlush();
+    const tick = (): void => {
+      this.triggerAutoFlush();
+    };
     const interval = setInterval(tick, resolved.intervalMs);
     unref(interval);
 
@@ -753,7 +1114,7 @@ export class OutboxQueue {
   }
 
   private triggerAutoFlush(): void {
-    if (!this.autoFlush || this.destroyed) return;
+    if (!this.autoFlush || this.destroyed || !this.isLeader) return;
     if (this.isHydrated && !this.mutations.some(m => m.status === 'pending')) return;
     this.flush().catch((err: unknown) => {
       this.logger?.error(`[resilient-outbox:${this.name}] Auto-flush failed:`, err);
@@ -776,7 +1137,9 @@ export class OutboxQueue {
     const delay = Math.max(0, earliest - Date.now());
     // Already-due mutations are blocked on a parent or on connectivity; leave them to the interval
     if (delay === 0 || delay >= state.options.intervalMs) return;
-    state.wakeTimer = setTimeout(() => this.triggerAutoFlush(), delay);
+    state.wakeTimer = setTimeout(() => {
+      this.triggerAutoFlush();
+    }, delay);
     unref(state.wakeTimer);
   }
 
@@ -784,13 +1147,23 @@ export class OutboxQueue {
 
   /**
    * Stops auto-flush, aborts any in-flight executor call (without consuming an attempt), and
-   * releases all listeners. Persisted state is kept. The instance cannot be used afterwards.
+   * releases all listeners. With `crossTab`, leadership passes to another instance immediately,
+   * and that instance retries whatever was in flight. Persisted state is kept. The instance cannot be used afterwards.
    */
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
     this.stopAutoFlushing();
     this.destroyController.abort();
+
+    for (const resolve of this.flushRequests.values()) resolve(0);
+    this.flushRequests.clear();
+
+    // Hand over immediately, even if an executor ignores its abort signal. The next leader
+    // resets and retries anything we had in flight (same idempotency keys).
+    this.releaseLeadership?.();
+    this.channel?.close();
+
     this.listeners.clear();
     this.eventListeners.clear();
   }
@@ -801,7 +1174,10 @@ export class OutboxQueue {
 
   // --- Events ---
 
-  /** Subscribes to a lifecycle event. Returns an unsubscribe function. */
+  /**
+   * Subscribes to a lifecycle event. Returns an unsubscribe function. With `crossTab`, execution
+   * events (`completed`, `retry`, `dead_letter`) fire in the leader's tab.
+   */
   on<K extends OutboxEventName>(event: K, listener: (payload: OutboxEventMap[K]) => void): () => void {
     let set = this.eventListeners.get(event);
     if (!set) {
@@ -847,26 +1223,20 @@ export class OutboxQueue {
       else if (m.status === 'dead_letter') deadLetter++;
     }
 
-    const prev = this.currentSnapshot;
-    if (
-      prev.total === this.mutations.length &&
-      prev.pending === pending &&
-      prev.syncing === syncing &&
-      prev.deadLetter === deadLetter &&
-      prev.isSyncing === this.isSyncing &&
-      prev.isHydrated === this.isHydrated
-    ) {
-      return; // Keep referential identity so React skips re-rendering
-    }
-
-    this.currentSnapshot = {
+    const next: QueueStateSnapshot = {
       total: this.mutations.length,
       pending,
       syncing,
       deadLetter,
-      isSyncing: this.isSyncing,
-      isHydrated: this.isHydrated
+      // In cross-tab mode another tab may be the one syncing
+      isSyncing: this.isSyncing || syncing > 0,
+      isHydrated: this.isHydrated,
+      isLeader: this.isLeader
     };
+    const prev = this.currentSnapshot;
+    const unchanged = (Object.keys(next) as (keyof QueueStateSnapshot)[]).every(k => prev[k] === next[k]);
+    // Keep referential identity when nothing changed so React skips re-rendering
+    if (!unchanged) this.currentSnapshot = next;
   }
 
   private notify(): void {

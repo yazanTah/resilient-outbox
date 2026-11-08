@@ -1,3 +1,5 @@
+import type { OutboxCoordinator } from './coordinator.js';
+
 export type MutationStatus = 'pending' | 'syncing' | 'dead_letter' | 'completed';
 
 /**
@@ -94,6 +96,14 @@ export interface OutboxQueueOptions {
    * burn retry attempts. Defaults to `navigator.onLine` when available, otherwise always online.
    */
   isOnline?: () => boolean | Promise<boolean>;
+  /**
+   * Coordinates instances that share this storage key, such as the same app open in several
+   * browser tabs. Every change becomes a locked read-modify-write of storage, and exactly one
+   * instance (the leader) executes mutations; leadership fails over when its tab closes.
+   * `true` uses the Web Locks API and `BroadcastChannel`; pass an `OutboxCoordinator` to supply
+   * your own. Default `false`.
+   */
+  crossTab?: boolean | OutboxCoordinator;
   /** Logger for internal warnings. Pass `null` to silence. Defaults to `console`. */
   logger?: OutboxLogger | null;
 }
@@ -128,6 +138,8 @@ export interface QueueStateSnapshot {
   deadLetter: number;
   isSyncing: boolean;
   isHydrated: boolean;
+  /** Whether this instance executes mutations. Always `true` unless `crossTab` is enabled. */
+  isLeader: boolean;
 }
 
 export interface OutboxEventMap {

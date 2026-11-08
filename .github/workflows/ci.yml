@@ -34,6 +34,19 @@ jobs:
           name: coverage
           path: coverage/lcov.info
 
+  e2e:
+    name: Cross-tab e2e (real Chromium tabs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
   test-matrix:
     name: Test on Node ${{ matrix.node }} / React ${{ matrix.react }}
     runs-on: ubuntu-latest

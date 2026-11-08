@@ -34,3 +34,47 @@ export class FlakyStorage implements OutboxStorageAdapter {
     this.data.delete(key);
   }
 }
+
+type LockCallback = () => Promise<unknown>;
+
+/**
+ * Minimal Web Locks (exclusive mode) implementation for runtimes that lack `navigator.locks`
+ * (Node < 24). Requests for a name are granted in FIFO order; a request aborted while still
+ * queued rejects with an AbortError, as the spec requires.
+ */
+export class FakeLockManager {
+  private queues = new Map<string, { start: () => void; started: boolean }[]>();
+
+  request(name: string, a: LockCallback | { signal?: AbortSignal }, b?: LockCallback): Promise<unknown> {
+    const callback = typeof a === 'function' ? a : b!;
+    const signal = typeof a === 'function' ? undefined : a.signal;
+    let queue = this.queues.get(name);
+    if (!queue) {
+      queue = [];
+      this.queues.set(name, queue);
+    }
+    const q = queue;
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        started: false,
+        start: () => {
+          entry.started = true;
+          callback()
+            .then(resolve, reject)
+            .finally(() => {
+              q.shift();
+              q[0]?.start();
+            });
+        }
+      };
+      signal?.addEventListener('abort', () => {
+        if (entry.started) return;
+        q.splice(q.indexOf(entry), 1);
+        reject(Object.assign(new Error('Lock request aborted'), { name: 'AbortError' }));
+      });
+      q.push(entry);
+      if (q.length === 1) entry.start();
+    });
+  }
+}
