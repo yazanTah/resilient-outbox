@@ -187,6 +187,12 @@ await outbox.retryDeadLetter(failed[0].id);
 - `getDeadLetter()`: Get all mutations quarantined in the Dead-Letter Queue.
 - `retryDeadLetter(id)`: Reset a dead-letter mutation to `pending`.
 - `retryAllDeadLetter()`: Reset all dead-letter mutations to `pending`.
+- `startAutoFlush({ intervalMs?, flushOnReconnect? })`: Flush pending mutations on an interval (default 15s) and on the browser `online` event. Returns a stop function. In React Native, also call `flush()` from your AppState / NetInfo listeners.
+- `stopAutoFlushing()`: Stop auto-flush.
+
+### Durability
+
+Queue state **and** the temp-ID map are persisted after every mutation, and writes are serialized, so a crash mid-flush or an app restart between a parent and its dependent child still resolves temp IDs correctly. Legacy (array-format) storage is migrated automatically on hydrate.
 - `remove(id)`: Remove a mutation from the queue.
 - `clear()`: Clear all mutations and cached ID mappings.
 - `subscribe(listener)`: Subscribe to state changes. Returns an unsubscribe function.

@@ -119,6 +119,8 @@ var OutboxQueue = class {
   isSyncing = false;
   activeFlushPromise = null;
   isHydrated = false;
+  persistChain = Promise.resolve();
+  stopAutoFlush = null;
   currentSnapshot = {
     total: 0,
     pending: 0,
@@ -152,12 +154,17 @@ var OutboxQueue = class {
       const raw = await this.storage.getItem(this.storageKey);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          this.mutations = parsed.map((m) => ({
+        const list = Array.isArray(parsed) ? parsed : parsed?.mutations;
+        const ids = Array.isArray(parsed) ? void 0 : parsed?.idMap;
+        if (Array.isArray(list)) {
+          this.mutations = list.map((m) => ({
             ...m,
             // If the app was killed while syncing, reset in-flight state to pending
             status: m.status === "syncing" ? "pending" : m.status
           }));
+        }
+        if (Array.isArray(ids)) {
+          for (const [k, v] of ids) this.idMap.set(k, v);
         }
       }
     } catch (err) {
@@ -167,14 +174,27 @@ var OutboxQueue = class {
       this.notify();
     }
   }
-  async persist() {
-    if (!this.autoPersist) return;
-    try {
-      const toStore = this.mutations.filter((m) => m.status !== "completed");
-      await this.storage.setItem(this.storageKey, JSON.stringify(toStore));
-    } catch (err) {
-      console.error(`[resilient-outbox:${this.name}] Failed to persist queue to storage:`, err);
-    }
+  /**
+   * Writes are serialized so concurrent enqueue/flush calls can never land in
+   * storage out of order. The state is serialized at write time, so the latest
+   * write always reflects the latest in-memory state.
+   */
+  persist() {
+    if (!this.autoPersist) return Promise.resolve();
+    const write = async () => {
+      try {
+        const toStore = {
+          version: 2,
+          mutations: this.mutations.filter((m) => m.status !== "completed"),
+          idMap: Array.from(this.idMap.entries())
+        };
+        await this.storage.setItem(this.storageKey, JSON.stringify(toStore));
+      } catch (err) {
+        console.error(`[resilient-outbox:${this.name}] Failed to persist queue to storage:`, err);
+      }
+    };
+    this.persistChain = this.persistChain.then(write, write);
+    return this.persistChain;
   }
   // --- Enqueue & Mutation Management ---
   async enqueue(options) {
@@ -367,6 +387,7 @@ var OutboxQueue = class {
             }
           }
         }
+        await this.persist();
       }
       await this.persist();
     } finally {
@@ -374,6 +395,40 @@ var OutboxQueue = class {
       this.notify();
     }
     return syncedCount;
+  }
+  // --- Auto Flush ---
+  /**
+   * Periodically flushes the queue and flushes immediately when the device
+   * comes back online (where `online` events exist, e.g. web / React Native Web).
+   * Returns a function that stops auto-flushing. Calling it again replaces the
+   * previous configuration. For React Native, call `queue.flush()` from an
+   * AppState / NetInfo listener in addition.
+   */
+  startAutoFlush(options = {}) {
+    this.stopAutoFlushing();
+    const intervalMs = options.intervalMs ?? 15e3;
+    const run = () => {
+      if (this.getPending().length > 0) {
+        this.flush().catch(
+          (err) => console.error(`[resilient-outbox:${this.name}] Auto-flush failed:`, err)
+        );
+      }
+    };
+    const timer = setInterval(run, intervalMs);
+    timer.unref?.();
+    const target = globalThis;
+    const listen = (options.flushOnReconnect ?? true) && typeof target.addEventListener === "function";
+    if (listen) target.addEventListener("online", run);
+    const stop = () => {
+      clearInterval(timer);
+      if (listen) target.removeEventListener?.("online", run);
+      if (this.stopAutoFlush === stop) this.stopAutoFlush = null;
+    };
+    this.stopAutoFlush = stop;
+    return stop;
+  }
+  stopAutoFlushing() {
+    this.stopAutoFlush?.();
   }
   // --- Subscriptions & React Snapshot ---
   subscribe(listener) {

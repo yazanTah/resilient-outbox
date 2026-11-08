@@ -1,5 +1,5 @@
 export { E as EnqueueOptions, M as Mutation, a as MutationError, b as MutationExecutor, c as MutationStatus, O as OutboxQueueOptions, d as OutboxStorageAdapter, Q as QueueStateSnapshot, R as RetryConfig, S as SyncContext } from './types-BRkMBWU8.mjs';
-export { O as OutboxQueue } from './queue-CEB70Jnj.mjs';
+export { O as OutboxQueue } from './queue-XTQksuvF.mjs';
 export { GenericKeyValueStorage, GenericStorageAdapter, MemoryStorageAdapter } from './adapters/index.mjs';
 
 /**

@@ -26,6 +26,8 @@ export class OutboxQueue {
   private isSyncing = false;
   private activeFlushPromise: Promise<number> | null = null;
   private isHydrated = false;
+  private persistChain: Promise<void> = Promise.resolve();
+  private stopAutoFlush: (() => void) | null = null;
   private currentSnapshot: QueueStateSnapshot = {
     total: 0,
     pending: 0,
@@ -65,12 +67,18 @@ export class OutboxQueue {
       const raw = await this.storage.getItem(this.storageKey);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          this.mutations = parsed.map((m: Mutation) => ({
+        // v2 format: { version, mutations, idMap }. Legacy v1 format: Mutation[]
+        const list: Mutation[] | undefined = Array.isArray(parsed) ? parsed : parsed?.mutations;
+        const ids: Array<[string, unknown]> | undefined = Array.isArray(parsed) ? undefined : parsed?.idMap;
+        if (Array.isArray(list)) {
+          this.mutations = list.map((m: Mutation) => ({
             ...m,
             // If the app was killed while syncing, reset in-flight state to pending
             status: m.status === 'syncing' ? 'pending' : m.status
           }));
+        }
+        if (Array.isArray(ids)) {
+          for (const [k, v] of ids) this.idMap.set(k, v);
         }
       }
     } catch (err) {
@@ -81,15 +89,29 @@ export class OutboxQueue {
     }
   }
 
-  private async persist(): Promise<void> {
-    if (!this.autoPersist) return;
-    try {
-      // Filter out completed mutations so storage does not grow indefinitely
-      const toStore = this.mutations.filter(m => m.status !== 'completed');
-      await this.storage.setItem(this.storageKey, JSON.stringify(toStore));
-    } catch (err) {
-      console.error(`[resilient-outbox:${this.name}] Failed to persist queue to storage:`, err);
-    }
+  /**
+   * Writes are serialized so concurrent enqueue/flush calls can never land in
+   * storage out of order. The state is serialized at write time, so the latest
+   * write always reflects the latest in-memory state.
+   */
+  private persist(): Promise<void> {
+    if (!this.autoPersist) return Promise.resolve();
+    const write = async (): Promise<void> => {
+      try {
+        // Filter out completed mutations so storage does not grow indefinitely.
+        // The idMap is persisted so temp IDs still resolve after an app restart.
+        const toStore = {
+          version: 2,
+          mutations: this.mutations.filter(m => m.status !== 'completed'),
+          idMap: Array.from(this.idMap.entries())
+        };
+        await this.storage.setItem(this.storageKey, JSON.stringify(toStore));
+      } catch (err) {
+        console.error(`[resilient-outbox:${this.name}] Failed to persist queue to storage:`, err);
+      }
+    };
+    this.persistChain = this.persistChain.then(write, write);
+    return this.persistChain;
   }
 
   // --- Enqueue & Mutation Management ---
@@ -329,6 +351,9 @@ export class OutboxQueue {
             }
           }
         }
+
+        // Checkpoint after every mutation so a crash mid-flush loses nothing
+        await this.persist();
       }
 
       await this.persist();
@@ -338,6 +363,49 @@ export class OutboxQueue {
     }
 
     return syncedCount;
+  }
+
+  // --- Auto Flush ---
+
+  /**
+   * Periodically flushes the queue and flushes immediately when the device
+   * comes back online (where `online` events exist, e.g. web / React Native Web).
+   * Returns a function that stops auto-flushing. Calling it again replaces the
+   * previous configuration. For React Native, call `queue.flush()` from an
+   * AppState / NetInfo listener in addition.
+   */
+  startAutoFlush(options: { intervalMs?: number; flushOnReconnect?: boolean } = {}): () => void {
+    this.stopAutoFlushing();
+    const intervalMs = options.intervalMs ?? 15000;
+    const run = () => {
+      if (this.getPending().length > 0) {
+        this.flush().catch(err =>
+          console.error(`[resilient-outbox:${this.name}] Auto-flush failed:`, err)
+        );
+      }
+    };
+
+    const timer = setInterval(run, intervalMs);
+    (timer as { unref?: () => void }).unref?.();
+
+    const target = globalThis as unknown as {
+      addEventListener?: (type: string, fn: () => void) => void;
+      removeEventListener?: (type: string, fn: () => void) => void;
+    };
+    const listen = (options.flushOnReconnect ?? true) && typeof target.addEventListener === 'function';
+    if (listen) target.addEventListener!('online', run);
+
+    const stop = () => {
+      clearInterval(timer);
+      if (listen) target.removeEventListener?.('online', run);
+      if (this.stopAutoFlush === stop) this.stopAutoFlush = null;
+    };
+    this.stopAutoFlush = stop;
+    return stop;
+  }
+
+  stopAutoFlushing(): void {
+    this.stopAutoFlush?.();
   }
 
   // --- Subscriptions & React Snapshot ---

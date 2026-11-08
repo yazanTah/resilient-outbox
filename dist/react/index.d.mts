@@ -1,4 +1,4 @@
-import { O as OutboxQueue } from '../queue-CEB70Jnj.mjs';
+import { O as OutboxQueue } from '../queue-XTQksuvF.mjs';
 import { Q as QueueStateSnapshot } from '../types-BRkMBWU8.mjs';
 
 interface UseOutboxReturn extends QueueStateSnapshot {
