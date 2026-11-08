@@ -5,8 +5,8 @@ on:
     tags: ['v*.*.*']
 
 permissions:
-  contents: write
-  id-token: write # npm provenance
+  contents: write # create the GitHub release
+  id-token: write # npm trusted publishing (OIDC) and provenance
 
 jobs:
   publish:
@@ -15,17 +15,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1
+      - run: npm install -g npm@^11.5.1
       - run: npm ci
       - name: Check tag matches package.json version
         run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
       - run: npm run verify
+      # Authenticated via npm trusted publishing: no token is stored anywhere.
+      # Configured at npmjs.com -> resilient-outbox -> Settings -> Trusted Publisher.
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Create GitHub release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        # Idempotent, so re-running a partially failed release is safe
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
