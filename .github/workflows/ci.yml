@@ -29,7 +29,7 @@ jobs:
       - run: npm run test:coverage
       - run: npm run build
       - run: npm run check:package
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage/lcov.info
