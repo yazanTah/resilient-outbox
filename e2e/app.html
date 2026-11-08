@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>resilient-outbox e2e</title>
+  </head>
+  <body>
+    <script type="module">
+      import { OutboxQueue, GenericStorageAdapter } from '/dist/index.mjs';
+
+      const params = new URLSearchParams(location.search);
+      const tab = params.get('tab');
+      const crossTab = params.get('crossTab') !== 'false';
+
+      window.outbox = new OutboxQueue({
+        name: 'e2e',
+        storage: new GenericStorageAdapter(localStorage),
+        crossTab,
+        executor: async (mutation, { signal, resolvePayload }) => {
+          const res = await fetch(`/api/${mutation.type}`, {
+            method: 'POST',
+            signal,
+            headers: {
+              'Content-Type': 'application/json',
+              'Idempotency-Key': mutation.idempotencyKey,
+              'X-Tab': tab
+            },
+            body: JSON.stringify(resolvePayload(mutation.payload))
+          });
+          if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { statusCode: res.status });
+          return res.json();
+        }
+      });
+      if (params.get('autoFlush') === 'true') window.outbox.startAutoFlush({ flushOnReconnect: false });
+      window.ready = true;
+    </script>
+  </body>
+</html>

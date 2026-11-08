@@ -1,40 +1,105 @@
 {
   "name": "resilient-outbox",
   "version": "1.0.0",
-  "description": "Durable Offline Mutation Queue & Sync Engine with Idempotency & Dependency Chaining for React Native & Web",
+  "description": "Durable offline mutation queue for React Native, Expo and the web: idempotency keys, dependency chaining with temp-ID mapping, and a dead-letter queue.",
+  "keywords": [
+    "offline",
+    "offline-first",
+    "outbox",
+    "mutation-queue",
+    "sync",
+    "idempotency",
+    "dead-letter-queue",
+    "retry",
+    "exponential-backoff",
+    "react-native",
+    "expo",
+    "react",
+    "asyncstorage",
+    "mmkv"
+  ],
   "author": "Yazan Taha (yazanTah)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yazanTah/resilient-outbox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yazanTah/resilient-outbox/issues"
+  },
+  "homepage": "https://github.com/yazanTah/resilient-outbox#readme",
+  "type": "commonjs",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "react": [
+        "./dist/react/index.d.ts"
+      ],
+      "adapters": [
+        "./dist/adapters/index.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
     },
     "./react": {
-      "types": "./dist/react/index.d.ts",
-      "import": "./dist/react/index.mjs",
-      "require": "./dist/react/index.js"
+      "import": {
+        "types": "./dist/react/index.d.mts",
+        "default": "./dist/react/index.mjs"
+      },
+      "require": {
+        "types": "./dist/react/index.d.ts",
+        "default": "./dist/react/index.js"
+      }
     },
     "./adapters": {
-      "types": "./dist/adapters/index.d.ts",
-      "import": "./dist/adapters/index.mjs",
-      "require": "./dist/adapters/index.js"
-    }
+      "import": {
+        "types": "./dist/adapters/index.d.mts",
+        "default": "./dist/adapters/index.mjs"
+      },
+      "require": {
+        "types": "./dist/adapters/index.d.ts",
+        "default": "./dist/adapters/index.js"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "react/package.json",
+    "adapters/package.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsup",
     "prepare": "npm run build",
     "test": "jest --runInBand",
     "test:coverage": "jest --runInBand --coverage",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.build.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check:package": "publint --strict && attw --pack .",
+    "verify": "npm run lint && npm run format:check && npm run typecheck && npm run test:coverage && npm run build && npm run check:package",
+    "prepublishOnly": "npm run verify",
+    "test:e2e": "npm run build && node e2e/multitab.mjs"
   },
   "peerDependencies": {
     "react": ">=18.0.0"
@@ -45,17 +110,25 @@
     }
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@eslint/js": "^10.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.10.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.7",
+    "eslint": "^10.14.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "jest": "^29.7.0",
-    "jest-environment-jsdom": "^30.5.2",
+    "jest-environment-jsdom": "^29.7.0",
+    "playwright": "^1.63.0",
+    "prettier": "^3.9.10",
+    "publint": "^0.3.25",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ts-jest": "^29.2.5",
     "tsup": "^8.3.5",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.72.1"
   }
 }

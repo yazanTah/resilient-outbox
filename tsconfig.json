@@ -1,21 +1,26 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "declaration": true,
     "declarationMap": true,
     "strict": true,
-    "noImplicitAny": true,
-    "strictNullChecks": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "isolatedModules": true,
+    "verbatimModuleSyntax": false,
     "forceConsistentCasingInFileNames": true,
     "jsx": "react-jsx",
-    "outDir": "./dist"
+    "outDir": "./dist",
+    "types": ["jest", "node"]
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*", "tests/**/*", "tsup.config.ts"]
 }
