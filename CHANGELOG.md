@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-09
+
 ### Changed
 
 - A `409` that carries `retryAfterMs` (for example from a `Retry-After` header) is now retried
