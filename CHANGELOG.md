@@ -83,6 +83,7 @@ All notable changes to this project are documented here. The format follows
 - `501` and `505` are now permanent errors; `408` and `425` are retryable.
 - A mutation that is mid-request can no longer be removed.
 
-[Unreleased]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/yazanTah/resilient-outbox/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/yazanTah/resilient-outbox/releases/tag/v1.0.0
