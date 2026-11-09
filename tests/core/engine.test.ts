@@ -50,6 +50,14 @@ describe('Error classification', () => {
     expect(m.error).toMatchObject({ code: 'MAX_ATTEMPTS', message: 'Exceeded max attempts (1): boom' });
   });
 
+  test('a 409 for a key still in progress is retried after Retry-After, a plain 409 is dead-lettered', async () => {
+    const inProgress = await run(Object.assign(httpError(409), { retryAfterMs: 2000 }));
+    expect(inProgress.status).toBe('pending');
+    expect(inProgress.attempts).toBe(1);
+    const conflict = await run(httpError(409));
+    expect(conflict.error?.code).toBe('NON_RETRYABLE');
+  });
+
   test('honors a server-provided retryAfterMs', async () => {
     const before = Date.now();
     const m = await run(Object.assign(httpError(429), { retryAfterMs: 60_000 }));
