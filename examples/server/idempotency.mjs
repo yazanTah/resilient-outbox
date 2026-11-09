@@ -17,9 +17,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 export function openDatabase(path) {
   const db = new DatabaseSync(path);
+  // busy_timeout must come first: switching to WAL and creating tables take a lock, and without
+  // a timeout a connection opened at the same moment as another fails with "database is locked"
+  db.exec('PRAGMA busy_timeout = 10000;');
   db.exec(`
     PRAGMA journal_mode = WAL;
-    PRAGMA busy_timeout = 10000;
     CREATE TABLE IF NOT EXISTS orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       item TEXT NOT NULL,
