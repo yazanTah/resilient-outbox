@@ -157,6 +157,7 @@ The executor signals failure by throwing. The status code is read from `err.stat
 | Error                              | Default behaviour                                                      |
 | :--------------------------------- | :--------------------------------------------------------------------- |
 | `408`, `425`, `429`                | Retried with exponential backoff and full jitter                       |
+| `409` with `retryAfterMs`          | Retried after that delay (server: "this key is still in progress")     |
 | Other `4xx`, `501`, `505`          | Dead-lettered immediately (`NON_RETRYABLE`). Does not block the queue. |
 | Other `5xx`                        | Retried up to `maxAttempts` (default 5), then dead-lettered            |
 | No status (network error, timeout) | Retried up to `maxAttempts`, then dead-lettered (`MAX_ATTEMPTS`)       |
@@ -185,19 +186,27 @@ Every dead-lettered mutation records why in `mutation.error.code`:
 
 ### Server contract
 
-Store the `Idempotency-Key` with the result of the first request, and return that stored result for any repeat:
+The client keeps the key stable; the server has to make the check-and-write **atomic**. "Look up the key, do the work, then save the key" in separate steps has two holes: two concurrent requests can both pass the lookup, and a crash after the work but before saving the key lets the retry do it again.
 
-```ts
-app.post('/:resource', async (req, res) => {
-  const key = req.header('Idempotency-Key');
-  const previous = key && (await idempotency.get(key));
-  if (previous) return res.status(previous.status).json(previous.body);
+**When the side effect is a write to your own database**, put the work and the key in the same transaction, with the key under a unique constraint:
 
-  const body = await create(req.params.resource, req.body);
-  if (key) await idempotency.set(key, { status: 201, body }, { ttlDays: 30 });
-  res.status(201).json(body);
-});
+```sql
+BEGIN;
+-- Unique key: a concurrent duplicate blocks here until we commit, then fails, and reads our result
+INSERT INTO idempotency_keys (key, status, body) VALUES ($1, 0, '{}');
+INSERT INTO orders (...) VALUES (...) RETURNING *;
+UPDATE idempotency_keys SET status = 201, body = $order_json WHERE key = $1;
+COMMIT;
+-- On a unique violation: SELECT status, body FROM idempotency_keys WHERE key = $1 and return it
 ```
+
+A crash anywhere before `COMMIT` leaves neither the order nor the key, so the retry starts clean. [`examples/server/idempotency.mjs`](./examples/server/idempotency.mjs) is a runnable version (Node's built-in SQLite), with tests that fire concurrent requests from separate threads and kill the process between the write and saving the key.
+
+**When the side effect is an external call** (charging a card through a payment provider), it can't join your transaction:
+
+1. Insert the key with status `in_progress` (unique constraint). If it exists and is complete, return the stored result. If it is still in progress, respond `409` with a `Retry-After` header; resilient-outbox retries a 409 that carries `retryAfterMs` instead of dead-lettering it.
+2. Call the provider and **pass the same idempotency key through** (Stripe, Adyen and most payment APIs accept one). If you crash after the charge, the retry's call is deduplicated by the provider.
+3. Save the result and mark the key complete. Treat `in_progress` rows older than your request timeout as abandoned and re-run step 2; the provider's key makes that safe.
 
 ---
 

@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A `409` that carries `retryAfterMs` (for example from a `Retry-After` header) is now retried
+  instead of dead-lettered. This is how servers answer a request whose idempotency key is still
+  being processed. A plain `409` is still treated as a permanent conflict.
+
+### Documentation
+
+- The README's server example had a race (two concurrent requests could both pass the lookup) and
+  a crash window (work done, key not saved). It now shows an atomic pattern for database writes
+  and a separate pattern for external payment calls, with a runnable reference implementation in
+  `examples/server/` covered by concurrency and crash tests.
+
 ## [1.0.1] - 2026-11-08
 
 ### Security

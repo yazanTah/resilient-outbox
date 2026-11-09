@@ -9,7 +9,9 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        projectService: { allowDefaultProject: ['*.js', '*.mjs', 'e2e/*.mjs'] },
+        projectService: {
+          allowDefaultProject: ['*.js', '*.mjs', 'e2e/*.mjs', 'examples/*/*.mjs', 'tests/examples/*.mjs']
+        },
         tsconfigRootDir: import.meta.dirname
       }
     },

@@ -80,6 +80,12 @@ describe('Backoff & Status Code Classification', () => {
       expect(isDefaultRetryable(null, 505)).toBe(false);
       expect(isDefaultRetryable(null, 302)).toBe(true);
     });
+
+    test('409 is retried only when the server asked to retry later', () => {
+      expect(isDefaultRetryable(new Error('conflict'), 409)).toBe(false);
+      expect(isDefaultRetryable({ retryAfterMs: 1000 }, 409)).toBe(true);
+      expect(isDefaultRetryable({ retryAfterMs: -1 }, 409)).toBe(false);
+    });
   });
 
   describe('getErrorStatusCode', () => {

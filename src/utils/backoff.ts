@@ -26,13 +26,17 @@ const PERMANENT_5XX = new Set([501, 505]);
 /**
  * Standard classification for HTTP and network errors:
  * - 408 Request Timeout, 425 Too Early and 429 Too Many Requests are retryable.
+ * - 409 Conflict is retryable when the server asked to retry later (`retryAfterMs`, e.g. from a
+ *   `Retry-After` header). That is how servers answer a request whose idempotency key is still
+ *   being processed. A 409 without it is a real conflict and is not retried.
  * - Other 4xx errors are client errors and non-retryable (quarantined to the Dead-Letter Queue).
  * - 5xx errors are retryable, except 501 Not Implemented and 505 HTTP Version Not Supported.
  * - Errors without a status code (network drops, timeouts, aborted connections) are retryable.
  */
-export function isDefaultRetryable(_error: unknown, statusCode?: number): boolean {
+export function isDefaultRetryable(error: unknown, statusCode?: number): boolean {
   if (statusCode === undefined) return true;
   if (RETRYABLE_4XX.has(statusCode)) return true;
+  if (statusCode === 409 && getErrorRetryAfterMs(error) !== undefined) return true;
   if (statusCode >= 400 && statusCode < 500) return false;
   if (PERMANENT_5XX.has(statusCode)) return false;
   return true;
